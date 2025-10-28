@@ -21,12 +21,15 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "https://www.riverpe.com",
+        "https://www.riverpe.com",                    # your custom domain
+        "https://riverpe-ui.vercel.app",              # Vercel default domain
+        "https://riverpe-c97ehoz2w-riverpe-developers-projects.vercel.app",  # deployment domain (from screenshot)
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ✅ Session middleware with secure cookie settings
 app.add_middleware(
