@@ -47,6 +47,7 @@ async def _submit_kyc_to_zynk(entity_id: str, routing_id: str, payload: dict) ->
     """
     Submit KYC documents to ZynkLabs API.
     """
+    # print(payload)
     url = f"{settings.zynk_base_url}/api/v1/transformer/entity/kyc/{entity_id}/{routing_id}"
     headers = {**_auth_header(), "Content-Type": "application/json"}
 
@@ -200,17 +201,14 @@ async def get_entity_by_id(
 async def upload_kyc_documents(
     entity_id: str,
     routing_id: str,
-    file: UploadFile = File(...),
-    transactionHash: str = Form(None),
-    base64Signature: str = Form(None),
-    full_name: str = Form(None),
-    date_of_birth: str = Form(None),
+    payload: dict,
     current: Entities = Depends(auth.get_current_entity)
 ):
     """
-    Upload KYC documents to S3 and submit to ZynkLabs API.
-    Requires authentication and ownership validation for security.
+    Receive KYC payload with documents and submit to ZynkLabs API.
+    Documents in the payload should be base64 encoded strings with proper MIME types.
     """
+    print("Received KYC upload payload:", payload)
     # Ensure the entity has an external_entity_id set
     if not current.external_entity_id:
         raise HTTPException(status_code=404, detail="Entity not linked to external service. Please complete the entity creation process.")
@@ -219,42 +217,55 @@ async def upload_kyc_documents(
     if current.external_entity_id != entity_id:
         raise HTTPException(status_code=403, detail="Access denied. You can only upload KYC documents for your own entity.")
 
-    # Validate file type (basic security)
-    if not file.content_type.startswith('image/'):
-        raise HTTPException(status_code=400, detail="Only image files are allowed for KYC documents.")
+    # Process the payload to handle documents
+    processed_payload = {"personal_details": {}}
 
-    # Generate unique file name
-    file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
-    file_name = f"kyc-{entity_id}-{routing_id}-{uuid.uuid4()}.{file_extension}"
+    # Walk through the payload structure and process documents
+    async def process_payload(data, parent_key=""):
+        if isinstance(data, dict):
+            result = {}
+            for key, value in data.items():
+                full_key = f"{parent_key}.{key}" if parent_key else key
+                if isinstance(value, str) and value.startswith('data:'):
+                    # This is a base64 encoded document
+                    try:
+                        # Extract MIME type and base64 data
+                        mime_type, base64_data = value.split(',', 1)
+                        mime_type = mime_type.split(':')[1].split(';')[0]  # Extract just the MIME type
 
-    # Upload to S3 and get URL
-    s3_url = await _upload_to_s3(file, file_name)
+                        # Validate MIME type
+                        if not mime_type.startswith('image/') and mime_type != 'application/pdf':
+                            raise HTTPException(status_code=400, detail=f"Invalid file type for field {full_key}: {mime_type}")
 
-    # Encode file to base64 for ZynkLabs
-    await file.seek(0)  # Reset file pointer
-    file_content = await file.read()
-    base64_document = base64.b64encode(file_content).decode('utf-8')
+                        # Generate unique file name
+                        file_extension = mime_type.split('/')[1] if '/' in mime_type else 'jpg'
+                        if mime_type == 'application/pdf':
+                            file_extension = 'pdf'
+                        file_name = f"kyc-{entity_id}-{routing_id}-{uuid.uuid4()}.{file_extension}"
 
-    # Construct payload
-    payload = {}
-    if transactionHash:
-        payload['transactionHash'] = transactionHash
-        if base64Signature:
-            payload['base64Signature'] = base64Signature
-        else:
-            raise HTTPException(status_code=400, detail="base64Signature is required when transactionHash is provided.")
+                        # Upload to S3 and get URL
+                        # Convert base64 back to bytes for S3 upload
+                        file_content = base64.b64decode(base64_data)
+                        s3_url = await _upload_to_s3_from_bytes(file_content, file_name, mime_type)
 
-    personal_details = {}
-    if full_name:
-        personal_details['full_name'] = full_name
-    if date_of_birth:
-        personal_details['date_of_birth'] = date_of_birth
-    personal_details['identity_document_url'] = s3_url
-    personal_details['identity_document'] = f"data:{file.content_type};base64,{base64_document}"
-    payload['personal_details'] = personal_details
+                        # Store both URL and base64 for ZynkLabs
+                        processed_payload["personal_details"][key] = {
+                            "url": s3_url,
+                            "base64": value  # Keep the full data URI for ZynkLabs
+                        }
+                    except Exception as e:
+                        raise HTTPException(status_code=400, detail=f"Failed to process document for field {full_key}: {str(e)}")
+                else:
+                    # Regular value, pass through
+                    result[key] = value
+            return result
+        return data
+
+    # Process the payload
+    processed_payload.update(await process_payload(payload))
 
     # Submit to ZynkLabs
-    zynk_response = await _submit_kyc_to_zynk(entity_id, routing_id, payload)
+    zynk_response = await _submit_kyc_to_zynk(entity_id, routing_id, processed_payload)
 
     # Return success response
     return KycUploadResponse(
@@ -262,6 +273,34 @@ async def upload_kyc_documents(
         message="KYC documents uploaded and submitted successfully.",
         data=zynk_response
     )
+
+async def _upload_to_s3_from_bytes(file_content: bytes, file_name: str, mime_type: str) -> str:
+    """
+    Upload bytes data to S3 and return the URL.
+    """
+    if not settings.aws_access_key_id or not settings.aws_secret_access_key or not settings.aws_region or not settings.aws_s3_bucket_name:
+        raise HTTPException(status_code=500, detail="AWS S3 configuration not set")
+
+    try:
+        import boto3
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=settings.aws_access_key_id,
+            aws_secret_access_key=settings.aws_secret_access_key,
+            region_name=settings.aws_region
+        )
+
+        s3_client.put_object(
+            Bucket=settings.aws_s3_bucket_name,
+            Key=file_name,
+            Body=file_content,
+            ContentType=mime_type
+        )
+        url = f"https://{settings.aws_s3_bucket_name}.s3.{settings.aws_region}.amazonaws.com/{file_name}"
+
+        return url
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload file to S3: {str(e)}")
 
 @router.get("/entity/kyc/{entity_id}", response_model=ZynkKycResponse)
 async def get_entity_kyc_status(
